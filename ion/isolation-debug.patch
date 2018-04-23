@@ -1,0 +1,426 @@
+diff --git a/drivers/staging/android/ion/ion_page_pool.c b/drivers/staging/android/ion/ion_page_pool.c
+index 63a69f5..5acebd5 100644
+--- a/drivers/staging/android/ion/ion_page_pool.c
++++ b/drivers/staging/android/ion/ion_page_pool.c
+@@ -25,32 +25,139 @@
+ #include <linux/vmalloc.h>
+ #include "ion_priv.h"
+ 
++
++#define ROW_SIZE (64*1024)
++#define ROW_SIZE_ORDER 4
++
+ static void *ion_page_pool_alloc_pages(struct ion_page_pool *pool)
+ {
+-	struct page *page;
+-
+-	page = alloc_pages(pool->gfp_mask & ~__GFP_ZERO, pool->order);
++	struct page *page, *next_page;
++    int pages_to_free;
++
++    if(pool->cached)
++    {
++        page = alloc_pages(pool->gfp_mask & ~__GFP_ZERO,
++                pool->order);
++        if (!page)
++            return NULL;
++
++
++        if (pool->gfp_mask & __GFP_ZERO)
++        {
++            if (msm_ion_heap_high_order_page_zero(page, pool->order))
++                goto error_cached_free_pages;
++        }
++
++        ion_page_pool_order_alloc_set_cache_policy(pool->order, page);
++
++        return page;
++error_cached_free_pages:
++        __free_pages(page, pool->order);
++        return NULL;
++    }
++
++    /* kav: do the followings:
++     * 1) allocate a bigger order as much as needed (pool->target_order)
++     * 2) fix up the start address
++     * 3) return the rest back to buddy
++     */
++	page = alloc_pages(pool->gfp_mask & ~__GFP_ZERO, pool->target_order);
+ 
+ 	if (!page)
+ 		return NULL;
+ 
+-	if (pool->gfp_mask & __GFP_ZERO)
+-		if (msm_ion_heap_high_order_page_zero(page, pool->order))
+-			goto error_free_pages;
+-
+-	ion_page_pool_alloc_set_cache_policy(pool, page);
+ 
+-	return page;
+-error_free_pages:
+-	__free_pages(page, pool->order);
++	if (pool->gfp_mask & __GFP_ZERO)
++    {
++		if (msm_ion_heap_high_order_page_zero(page + (ROW_SIZE / PAGE_SIZE),
++                    pool->order))
++			goto error_uncached_free_pages;
++    }
++
++    if(pool->order <= ROW_SIZE_ORDER)
++    {
++        pages_to_free = ROW_SIZE / PAGE_SIZE;
++        next_page = page + 3*(ROW_SIZE / PAGE_SIZE);
++    }
++    else
++    {
++        pages_to_free = ((order_to_size(pool->target_order) -
++                order_to_size(pool->order)) - (2*ROW_SIZE)) / PAGE_SIZE;
++        next_page = page + 2*(ROW_SIZE / PAGE_SIZE) +
++            (order_to_size(pool->target_order - 1) / PAGE_SIZE);
++    }
++
++    if(pages_to_free)
++    {
++        int i;
++        for(i = 0; i < pages_to_free; i++)
++        {
++            __free_page(next_page);
++            next_page++;
++        }
++    }
++
++	ion_page_pool_order_alloc_set_cache_policy(pool->order,
++            page + (ROW_SIZE / PAGE_SIZE));
++
++    pr_debug("ion_page_pool_alloc_pages: requested %u allocated %lu target %p\n",
++            order_to_size(pool->order),
++            order_to_size(pool->target_order) - (pages_to_free * PAGE_SIZE),
++            page + (ROW_SIZE / PAGE_SIZE));
++
++	return page + (ROW_SIZE / PAGE_SIZE);
++error_uncached_free_pages:
++	__free_pages(page, pool->target_order);
+ 	return NULL;
+ }
+ 
+ static void ion_page_pool_free_pages(struct ion_page_pool *pool,
+ 				     struct page *page)
+ {
+-	ion_page_pool_free_set_cache_policy(pool, page);
+-	__free_pages(page, pool->order);
++    ion_page_pool_order_free_set_cache_policy(pool->order, page);
++
++    if(pool->cached)
++    {
++        __free_pages(page, pool->order);
++    }
++    else
++    {
++        /*
++         * kav:
++         * need to free: ROW + BUFFER + ROW
++         * BUFFER_SIZE is ROW_SIZE if pool->order <= ROW_SIZE_ORDER
++         * else it is pool->target_order - 1
++         */
++        page -= (ROW_SIZE / PAGE_SIZE);
++
++        if(pool->order <= ROW_SIZE_ORDER)
++        {
++            __free_pages(page, ROW_SIZE_ORDER);
++            __free_pages(page + (ROW_SIZE / PAGE_SIZE), ROW_SIZE_ORDER);
++            __free_pages(page + 2*(ROW_SIZE / PAGE_SIZE), ROW_SIZE_ORDER);
++
++            pr_debug("ion_page_pool_free_pages: requested %d freed %d target %p\n",
++                    order_to_size(pool->order),
++                    3*ROW_SIZE,
++                    page + (ROW_SIZE / PAGE_SIZE));
++        }
++        else
++        {
++            __free_pages(page, pool->target_order - 1);
++            __free_pages(page +
++                    (order_to_size(pool->target_order - 1) / PAGE_SIZE),
++                    ROW_SIZE_ORDER);
++            __free_pages(page +
++                    (order_to_size(pool->target_order - 1) / PAGE_SIZE) +
++                    (ROW_SIZE / PAGE_SIZE),
++                    ROW_SIZE_ORDER);
++
++            pr_debug("ion_page_pool_free_pages: requested %d freed %d target %p\n",
++                    order_to_size(pool->order),
++                    order_to_size(pool->order) + 2 * ROW_SIZE,
++                    page + (ROW_SIZE / PAGE_SIZE));
++        }
++    }
+ }
+ 
+ static int ion_page_pool_add(struct ion_page_pool *pool, struct page *page,
+@@ -67,6 +174,23 @@ static int ion_page_pool_add(struct ion_page_pool *pool, struct page *page,
+ 	if (!prefetch)
+ 		pool->nr_unreserved++;
+ 
++    if(!pool->cached)
++    {
++        if(pool->order <= ROW_SIZE_ORDER)
++        {
++            pr_debug("ion_page_pool_add: requested %d freed %d target %p\n",
++                    order_to_size(pool->order),
++                    3 * ROW_SIZE,
++                    page);
++        }
++        else
++        {
++            pr_debug("ion_page_pool_add: requested %d freed %d target %p\n",
++                    order_to_size(pool->order),
++                    order_to_size(pool->order) + 2 * ROW_SIZE,
++                    page);
++        }
++    }
+ 	mutex_unlock(&pool->mutex);
+ 	return 0;
+ }
+@@ -94,6 +218,26 @@ static struct page *ion_page_pool_remove(struct ion_page_pool *pool, bool high,
+ 						pool->nr_unreserved);
+ 
+ 	list_del(&page->lru);
++
++
++    if(!pool->cached)
++    {
++        if(pool->order <= ROW_SIZE_ORDER)
++        {
++            pr_debug("ion_page_pool_alloc: requested %d allocated %d target %p\n",
++                    order_to_size(pool->order),
++                    3 * ROW_SIZE,
++                    page);
++        }
++        else
++        {
++            pr_debug("ion_page_pool_alloc: requested %d allocated %d target %p\n",
++                    order_to_size(pool->order),
++                    order_to_size(pool->order) + 2 * ROW_SIZE,
++                    page);
++        }
++    }
++
+ 	return page;
+ }
+ 
+@@ -116,6 +260,7 @@ void *ion_page_pool_alloc(struct ion_page_pool *pool, bool *from_pool)
+ 		page = ion_page_pool_alloc_pages(pool);
+ 		*from_pool = false;
+ 	}
++
+ 	return page;
+ }
+ 
+@@ -138,6 +283,7 @@ void *ion_page_pool_prefetch(struct ion_page_pool *pool, bool *from_pool)
+ 		page = ion_page_pool_alloc_pages(pool);
+ 		*from_pool = false;
+ 	}
++
+ 	return page;
+ }
+ /*
+@@ -165,8 +311,11 @@ void ion_page_pool_free(struct ion_page_pool *pool, struct page *page,
+ {
+ 	int ret;
+ 
+-	BUG_ON(pool->order != compound_order(page));
+-
++    /* kav: the order of the pool no longer matches the compound_order of
++     * the page after we do row isolation.
++     */
++	/* BUG_ON(pool->order != compound_order(page)); */
++
+ 	ret = ion_page_pool_add(pool, page, prefetch);
+ 	/* FIXME? For a secure page, not hyp unassigned in this err path */
+ 	if (ret)
+@@ -222,7 +371,8 @@ int ion_page_pool_shrink(struct ion_page_pool *pool, gfp_t gfp_mask,
+ 	return freed;
+ }
+ 
+-struct ion_page_pool *ion_page_pool_create(gfp_t gfp_mask, unsigned int order)
++struct ion_page_pool *ion_page_pool_create(gfp_t gfp_mask, unsigned int order,
++        bool cached)
+ {
+ 	struct ion_page_pool *pool = kmalloc(sizeof(struct ion_page_pool),
+ 					     GFP_KERNEL);
+@@ -235,9 +385,21 @@ struct ion_page_pool *ion_page_pool_create(gfp_t gfp_mask, unsigned int order)
+ 	INIT_LIST_HEAD(&pool->high_items);
+ 	pool->gfp_mask = gfp_mask | __GFP_COMP;
+ 	pool->order = order;
++    pool->cached = cached;
+ 	mutex_init(&pool->mutex);
+ 	plist_node_init(&pool->list, order);
+ 
++
++    /* kav: fixing up the order for RH isolation */
++    if(pool->order <= ROW_SIZE_ORDER)
++    {
++        pool->target_order = ROW_SIZE_ORDER + 2;
++    }
++    else
++    {
++        pool->target_order = pool->order + 1;
++    }
++
+ 	return pool;
+ }
+ 
+diff --git a/drivers/staging/android/ion/ion_priv.h b/drivers/staging/android/ion/ion_priv.h
+index c681c1a..aca14bb 100644
+--- a/drivers/staging/android/ion/ion_priv.h
++++ b/drivers/staging/android/ion/ion_priv.h
+@@ -251,6 +251,14 @@ struct pages_mem {
+ 	void (*free_fn) (const void *);
+ };
+ 
++
++
++static inline unsigned int order_to_size(int order)
++{
++	return PAGE_SIZE << order;
++}
++
++
+ /**
+  * some helpers for common operations on buffers using the sg_table
+  * and vaddr fields
+@@ -436,10 +444,13 @@ struct ion_page_pool {
+ 	struct mutex mutex;
+ 	gfp_t gfp_mask;
+ 	unsigned int order;
++	unsigned int target_order;
++    bool cached;
+ 	struct plist_node list;
+ };
+ 
+-struct ion_page_pool *ion_page_pool_create(gfp_t gfp_mask, unsigned int order);
++struct ion_page_pool *ion_page_pool_create(gfp_t gfp_mask, unsigned int order,
++        bool cached);
+ void ion_page_pool_destroy(struct ion_page_pool *);
+ void *ion_page_pool_alloc(struct ion_page_pool *, bool *from_pool);
+ void *ion_page_pool_alloc_pool_only(struct ion_page_pool *);
+@@ -467,6 +478,26 @@ static inline void ion_page_pool_free_set_cache_policy
+ 		set_memory_wb((unsigned long)va, 1 << pool->order);
+ 
+ }
++
++static inline void ion_page_pool_order_alloc_set_cache_policy
++				(unsigned int order,
++				struct page *page){
++	void *va = page_address(page);
++
++	if (va)
++		set_memory_wc((unsigned long)va, 1 << order);
++}
++
++static inline void ion_page_pool_order_free_set_cache_policy
++				(unsigned int order,
++				struct page *page){
++	void *va = page_address(page);
++
++	if (va)
++		set_memory_wb((unsigned long)va, 1 << order);
++
++}
++
+ #else
+ static inline void ion_page_pool_alloc_set_cache_policy
+ 				(struct ion_page_pool *pool,
+@@ -475,6 +506,15 @@ static inline void ion_page_pool_alloc_set_cache_policy
+ static inline void ion_page_pool_free_set_cache_policy
+ 				(struct ion_page_pool *pool,
+ 				struct page *page){ }
++
++static inline void ion_page_pool_order_alloc_set_cache_policy
++				(unsigned int order,
++				struct page *page){ }
++
++static inline void ion_page_pool_order_free_set_cache_policy
++				(unsigned int order,
++				struct page *page){ }
++
+ #endif
+ 
+ 
+diff --git a/drivers/staging/android/ion/ion_system_heap.c b/drivers/staging/android/ion/ion_system_heap.c
+index 10e8a73..798de2b 100644
+--- a/drivers/staging/android/ion/ion_system_heap.c
++++ b/drivers/staging/android/ion/ion_system_heap.c
+@@ -37,7 +37,7 @@ static gfp_t high_order_gfp_flags = (GFP_HIGHUSER | __GFP_NOWARN |
+ static gfp_t low_order_gfp_flags  = (GFP_HIGHUSER | __GFP_NOWARN);
+ 
+ #ifndef CONFIG_ALLOC_BUFFERS_IN_4K_CHUNKS
+-static const unsigned int orders[] = {4, 0};
++static const unsigned int orders[] = {10, 9, 8, 7, 6, 5, 4, 0};
+ #else
+ static const unsigned int orders[] = {0};
+ #endif
+@@ -53,11 +53,6 @@ static int order_to_index(unsigned int order)
+ 	return -1;
+ }
+ 
+-static unsigned int order_to_size(int order)
+-{
+-	return PAGE_SIZE << order;
+-}
+-
+ struct ion_system_heap {
+ 	struct ion_heap heap;
+ 	struct ion_page_pool **uncached_pools;
+@@ -99,6 +94,7 @@ static struct page *alloc_buffer_page(struct ion_system_heap *heap,
+ 		gfp_t gfp_mask = low_order_gfp_flags;
+ 		if (order)
+ 			gfp_mask = high_order_gfp_flags;
++        printk(KERN_WARNING "alloc_pages outside ion_page_pool\n");
+ 		page = alloc_pages(gfp_mask, order);
+ 	}
+ 	if (!page)
+@@ -133,6 +129,7 @@ static void free_buffer_page(struct ion_system_heap *heap,
+ 		else
+ 			ion_page_pool_free(pool, page, prefetch);
+ 	} else {
++        printk(KERN_WARNING "__free_pages outside ion_page_pool\n");
+ 		__free_pages(page, order);
+ 	}
+ }
+@@ -630,7 +627,7 @@ static void ion_system_heap_destroy_pools(struct ion_page_pool **pools)
+  * nothing. If it succeeds you'll eventually need to use
+  * ion_system_heap_destroy_pools to destroy the pools.
+  */
+-static int ion_system_heap_create_pools(struct ion_page_pool **pools)
++static int ion_system_heap_create_pools(struct ion_page_pool **pools, bool cached)
+ {
+ 	int i;
+ 	for (i = 0; i < num_orders; i++) {
+@@ -639,7 +636,7 @@ static int ion_system_heap_create_pools(struct ion_page_pool **pools)
+ 
+ 		if (orders[i])
+ 			gfp_flags = high_order_gfp_flags;
+-		pool = ion_page_pool_create(gfp_flags, orders[i]);
++		pool = ion_page_pool_create(gfp_flags, orders[i], cached);
+ 		if (!pool)
+ 			goto err_create_pool;
+ 		pools[i] = pool;
+@@ -676,15 +673,15 @@ struct ion_heap *ion_system_heap_create(struct ion_platform_heap *unused)
+ 			heap->secure_pools[i] = kzalloc(pools_size, GFP_KERNEL);
+ 			if (!heap->secure_pools[i])
+ 				goto err_create_secure_pools;
+-			if (ion_system_heap_create_pools(heap->secure_pools[i]))
++			if (ion_system_heap_create_pools(heap->secure_pools[i], true))
+ 				goto err_create_secure_pools;
+ 		}
+ 	}
+ 
+-	if (ion_system_heap_create_pools(heap->uncached_pools))
++	if (ion_system_heap_create_pools(heap->uncached_pools, false))
+ 		goto err_create_uncached_pools;
+ 
+-	if (ion_system_heap_create_pools(heap->cached_pools))
++	if (ion_system_heap_create_pools(heap->cached_pools, true))
+ 		goto err_create_cached_pools;
+ 
+ 	heap->heap.debug_show = ion_system_heap_debug_show;
+

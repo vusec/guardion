@@ -1,0 +1,406 @@
+diff --git a/arch/arm64/kernel/perf_event.c b/arch/arm64/kernel/perf_event.c
+index a07d1f4..c122eae 100644
+--- a/arch/arm64/kernel/perf_event.c
++++ b/arch/arm64/kernel/perf_event.c
+@@ -624,7 +624,7 @@ enum armv8_pmuv3_perf_types {
+ /* PMUv3 HW events mapping. */
+ const unsigned armv8_pmuv3_perf_map[PERF_COUNT_HW_MAX] = {
+ 	[PERF_COUNT_HW_CPU_CYCLES]		= ARMV8_PMUV3_PERFCTR_CLOCK_CYCLES,
+-	[PERF_COUNT_HW_INSTRUCTIONS]		= ARMV8_PMUV3_PERFCTR_INSTR_EXECUTED,
++	[PERF_COUNT_HW_INSTRUCTIONS]		= ARMV8_PMUV3_PERFCTR_BUS_ACCESS,
+ 	[PERF_COUNT_HW_CACHE_REFERENCES]	= ARMV8_PMUV3_PERFCTR_L1_DCACHE_ACCESS,
+ 	[PERF_COUNT_HW_CACHE_MISSES]		= ARMV8_PMUV3_PERFCTR_L1_DCACHE_REFILL,
+ 	[PERF_COUNT_HW_BRANCH_INSTRUCTIONS]	= HW_OP_UNSUPPORTED,
+diff --git a/drivers/base/dma-coherent.c b/drivers/base/dma-coherent.c
+index 55b8398..42c0f54 100644
+--- a/drivers/base/dma-coherent.c
++++ b/drivers/base/dma-coherent.c
+@@ -14,6 +14,7 @@ struct dma_coherent_mem {
+ 	int		size;
+ 	int		flags;
+ 	unsigned long	*bitmap;
++    unsigned long   *guards; /* @vvdveen - dmasguard */
+ 	spinlock_t	spinlock;
+ };
+ 
+@@ -42,6 +43,11 @@ static int dma_init_coherent_memory(phys_addr_t phys_addr, dma_addr_t device_add
+ 	if (!dma_mem->bitmap)
+ 		goto out;
+ 
++    /* @vvdveen - dmasguard */
++    dma_mem->guards = kzalloc(bitmap_size, GFP_KERNEL);
++    if (!dma_mem->guards)
++        goto out;
++
+ 	dma_mem->virt_base = mem_base;
+ 	dma_mem->device_base = device_addr;
+ 	dma_mem->pfn_base = PFN_DOWN(phys_addr);
+@@ -172,7 +178,7 @@ int dma_alloc_from_coherent(struct device *dev, ssize_t size,
+ 	if (unlikely(size > (mem->size << PAGE_SHIFT)))
+ 		goto err;
+ 
+-	pageno = bitmap_find_free_region(mem->bitmap, mem->size, order);
++	pageno = bitmap_find_free_region_guarded(mem->bitmap, mem->size, order, mem->guards);
+ 	if (unlikely(pageno < 0))
+ 		goto err;
+ 
+@@ -220,7 +226,7 @@ int dma_release_from_coherent(struct device *dev, int order, void *vaddr)
+ 		unsigned long flags;
+ 
+ 		spin_lock_irqsave(&mem->spinlock, flags);
+-		bitmap_release_region(mem->bitmap, page, order);
++		bitmap_release_region_guarded(mem->bitmap, page, order, mem->guards, mem->size);
+ 		spin_unlock_irqrestore(&mem->spinlock, flags);
+ 		return 1;
+ 	}
+diff --git a/include/linux/bitmap.h b/include/linux/bitmap.h
+index e1c8d08..c04ac32 100644
+--- a/include/linux/bitmap.h
++++ b/include/linux/bitmap.h
+@@ -113,12 +113,24 @@ extern int __bitmap_subset(const unsigned long *bitmap1,
+ extern int __bitmap_weight(const unsigned long *bitmap, unsigned int nbits);
+ 
+ extern void bitmap_set(unsigned long *map, unsigned int start, int len);
++extern void bitmap_set_guarded(unsigned long *map, unsigned int start, int len,
++                     unsigned long *guard,
++                     unsigned long size);
+ extern void bitmap_clear(unsigned long *map, unsigned int start, int len);
++extern void bitmap_clear_guarded(unsigned long *map, unsigned int start, int len,
++                     unsigned long *guard,
++                     unsigned long size);
+ extern unsigned long bitmap_find_next_zero_area(unsigned long *map,
+ 					 unsigned long size,
+ 					 unsigned long start,
+ 					 unsigned int nr,
+ 					 unsigned long align_mask);
++extern unsigned long bitmap_find_next_zero_area_guarded(unsigned long *map,
++					 unsigned long size,
++					 unsigned long start,
++					 unsigned int nr,
++					 unsigned long align_mask,
++                     unsigned long *guard);
+ 
+ extern int bitmap_scnprintf(char *buf, unsigned int len,
+ 			const unsigned long *src, int nbits);
+@@ -141,7 +153,11 @@ extern void bitmap_onto(unsigned long *dst, const unsigned long *orig,
+ extern void bitmap_fold(unsigned long *dst, const unsigned long *orig,
+ 		int sz, int bits);
+ extern int bitmap_find_free_region(unsigned long *bitmap, unsigned int bits, int order);
++extern int bitmap_find_free_region_guarded(unsigned long *bitmap, unsigned int bits, int order,
++                    unsigned long *guard);
+ extern void bitmap_release_region(unsigned long *bitmap, unsigned int pos, int order);
++extern void bitmap_release_region_guarded(unsigned long *bitmap, unsigned int pos, int order,
++                    unsigned long *guard, unsigned int size);
+ extern int bitmap_allocate_region(unsigned long *bitmap, unsigned int pos, int order);
+ extern void bitmap_copy_le(void *dst, const unsigned long *src, int nbits);
+ extern int bitmap_ord_to_pos(const unsigned long *bitmap, int n, int bits);
+diff --git a/lib/bitmap.c b/lib/bitmap.c
+index 2ed91904..9972526 100644
+--- a/lib/bitmap.c
++++ b/lib/bitmap.c
+@@ -1,3 +1,12 @@
++/* @vvdveen - dmasguard
++ *
++ * FIXME I assume one bit is one page (i.e., order_per_bit = 0). I think things
++ * will break if this is not true.
++ */
++#define ROWSIZE_ORDER 5
++#define ROWSIZE_BITS 16
++
++
+ /*
+  * lib/bitmap.c
+  * Helper functions for bitmap.h.
+@@ -284,6 +293,61 @@ int __bitmap_weight(const unsigned long *bitmap, unsigned int bits)
+ }
+ EXPORT_SYMBOL(__bitmap_weight);
+ 
++/* @vvdveen - dmasguard */
++void bitmap_guards_enable(unsigned long *map, unsigned long *guard, unsigned long size)
++{
++	int i;
++    unsigned long index;
++
++    for (;;) {
++        index = bitmap_find_next_zero_area(map, size, i, ROWSIZE_BITS, ROWSIZE_BITS-1);
++        if (index > size)
++            return;
++
++        if (index % (ROWSIZE_BITS * 2) == 1) {
++            bitmap_set(  map, index, ROWSIZE_BITS);
++            bitmap_set(guard, index, ROWSIZE_BITS);
++        }
++
++        i = i + ROWSIZE_BITS; // ??
++    }
++}
++void bitmap_guards_disable(unsigned long *map, unsigned long *guard, unsigned long size)
++{
++    unsigned long start;
++    unsigned long index;
++
++    start = 0;
++    for (;;) {
++	    index = find_next_bit(guard, size, start);
++        bitmap_clear(  map, index, ROWSIZE_BITS);
++        bitmap_clear(guard, index, ROWSIZE_BITS);
++        start = start + ROWSIZE_BITS;
++    }
++}
++
++/* @vvdveen - dmasguard */
++void bitmap_set_guarded(unsigned long *map, unsigned int start, int len, unsigned long *guard,
++                        unsigned long size)
++{
++    /* Normal execution if less than a row is requested */
++    if (len < ROWSIZE_BITS)
++        return bitmap_set(map, start, len);
++
++    /* We assume that bitmap_set_guarded() is always called after a call to
++     * bitmap_find_next_zero_area_guarded() in which we already disabled all
++     * guard rows to find a zero area of the request len + 2 guard rows.
++     *
++     * With the guard rows disabled, we now allocate the requested size + 2
++     * guard rows.
++     */
++    bitmap_set(map, start - ROWSIZE_BITS, len + ROWSIZE_BITS + ROWSIZE_BITS);
++
++    /* Only thing left is to mark all odd rows as guards again */
++    bitmap_guards_enable(map, guard, size);
++}
++EXPORT_SYMBOL(bitmap_set_guarded);
++
+ void bitmap_set(unsigned long *map, unsigned int start, int len)
+ {
+ 	unsigned long *p = map + BIT_WORD(start);
+@@ -305,6 +369,19 @@ void bitmap_set(unsigned long *map, unsigned int start, int len)
+ }
+ EXPORT_SYMBOL(bitmap_set);
+ 
++/* @vvdveen - dmasguard */
++void bitmap_clear_guarded(unsigned long *map, unsigned int start, int len, unsigned long *guard,
++                          unsigned long size)
++{
++    if (len < ROWSIZE_BITS)
++        return bitmap_clear(map, start, len);
++
++    bitmap_guards_disable(map, guard, size);
++    bitmap_clear(map, start - ROWSIZE_BITS, len + ROWSIZE_BITS + ROWSIZE_BITS);
++    bitmap_guards_enable(map, guard, size);
++}
++EXPORT_SYMBOL(bitmap_clear_guarded);
++
+ void bitmap_clear(unsigned long *map, unsigned int start, int len)
+ {
+ 	unsigned long *p = map + BIT_WORD(start);
+@@ -326,6 +403,29 @@ void bitmap_clear(unsigned long *map, unsigned int start, int len)
+ }
+ EXPORT_SYMBOL(bitmap_clear);
+ 
++/* @vvdveen - dmasguard */
++unsigned long bitmap_find_next_zero_area_guarded(unsigned long *map,
++					 unsigned long size,
++					 unsigned long start,
++					 unsigned int nr,
++					 unsigned long align_mask,
++                     unsigned long *guard)
++{
++    unsigned long index;
++    if (size <= ROWSIZE_BITS)
++        return bitmap_find_next_zero_area(map, size, start, nr, align_mask);
++
++    bitmap_guards_disable(map, guard, size);
++    index = bitmap_find_next_zero_area(map, size, start,
++            ROWSIZE_BITS + nr + ROWSIZE_BITS, align_mask);
++
++    /* bitmap_set_guarded() will be called next, this is where we take care of
++     * enabling the guarded rows again.
++     */
++    return index + ROWSIZE_BITS;
++}
++EXPORT_SYMBOL(bitmap_find_next_zero_area_guarded);
++
+ /*
+  * bitmap_find_next_zero_area - find a contiguous aligned zero area
+  * @map: The address to base the search on
+@@ -1051,6 +1151,11 @@ enum {
+ 	REG_OP_ISFREE,		/* true if region is all zero bits */
+ 	REG_OP_ALLOC,		/* set all bits in region */
+ 	REG_OP_RELEASE,		/* clear all bits in region */
++
++    /* @vvdveen - dmasguard */
++    REG_OP_ISFREE_GUARDED,
++    REG_OP_ALLOC_GUARDED,
++    REG_OP_RELEASE_GUARDED,
+ };
+ 
+ static int __reg_op(unsigned long *bitmap, unsigned int pos, int order, int reg_op)
+@@ -1091,20 +1196,72 @@ static int __reg_op(unsigned long *bitmap, unsigned int pos, int order, int reg_
+ 		ret = 1;	/* all bits in region free (zero) */
+ 		break;
+ 
++    /* @vvdveen - dmasguard */
++    case REG_OP_ISFREE_GUARDED:
++        for (i = 0; i < nlongs_reg + ROWSIZE_BITS + ROWSIZE_BITS; i++) {
++            if (bitmap[index + i] & mask)
++                goto done;
++        }
++        ret = 1;
++        break;
++
+ 	case REG_OP_ALLOC:
+ 		for (i = 0; i < nlongs_reg; i++)
+ 			bitmap[index + i] |= mask;
+ 		break;
+ 
++    /* @vvdveen - dmasguard */
++    case REG_OP_ALLOC_GUARDED:
++        for (i = 0; i < nlongs_reg + ROWSIZE_BITS + ROWSIZE_BITS; i++)
++            bitmap[index + i] |= mask;
++        break;
++
+ 	case REG_OP_RELEASE:
+ 		for (i = 0; i < nlongs_reg; i++)
+ 			bitmap[index + i] &= ~mask;
+ 		break;
++
++    /* @vvdveen - dmasguard */
++    case REG_OP_RELEASE_GUARDED:
++        for (i = 0; i < nlongs_reg + ROWSIZE_BITS + ROWSIZE_BITS; i++)
++            bitmap[index + i] &= ~mask;
++        break;
+ 	}
+ done:
+ 	return ret;
+ }
+ 
++/* @vvdveen - dmasguard */
++int bitmap_find_free_region_guarded(unsigned long *bitmap, unsigned int bits, int order,
++                                    unsigned long *guard)
++{
++	unsigned int pos, end;		/* scans bitmap by regions of size order */
++
++    if (order < ROWSIZE_ORDER)
++        return bitmap_find_free_region(bitmap, bits, order);
++
++    bitmap_guards_disable(bitmap, guard, bits);
++
++    /* We need a custom implementation of bitmap_find_free_region(), so that we
++     * can let it allocate two additional guard rows instead of an entire extra
++     * order:
++     */
++
++	for (pos = 0 ; (end = pos + (1U << order) + ROWSIZE_BITS + ROWSIZE_BITS) <= bits; pos = end) {
++		if (!__reg_op(bitmap, pos, order, REG_OP_ISFREE_GUARDED))
++			continue;
++		__reg_op(bitmap, pos, order, REG_OP_ALLOC_GUARDED);
++
++        bitmap_guards_enable(bitmap, guard, bits);
++		return pos + ROWSIZE_BITS;
++	}
++
++    bitmap_guards_enable(bitmap, guard, bits);
++
++	return -ENOMEM;
++}
++EXPORT_SYMBOL(bitmap_find_free_region_guarded);
++
+ /**
+  * bitmap_find_free_region - find a contiguous aligned mem region
+  *	@bitmap: array of unsigned longs corresponding to the bitmap
+@@ -1133,6 +1290,19 @@ int bitmap_find_free_region(unsigned long *bitmap, unsigned int bits, int order)
+ }
+ EXPORT_SYMBOL(bitmap_find_free_region);
+ 
++/* @vvdveen - dmasguard */
++void bitmap_release_region_guarded(unsigned long *bitmap, unsigned int pos, int order,
++                                   unsigned long *guard, unsigned int size)
++{
++    if (order < ROWSIZE_ORDER)
++        return bitmap_release_region(bitmap, pos, order);
++
++    bitmap_guards_disable(bitmap, guard, size);
++    __reg_op(bitmap, pos - ROWSIZE_BITS, order, REG_OP_RELEASE_GUARDED);
++    bitmap_guards_enable(bitmap, guard, size);
++}
++EXPORT_SYMBOL(bitmap_release_region_guarded);
++
+ /**
+  * bitmap_release_region - release allocated bitmap region
+  *	@bitmap: array of unsigned longs corresponding to the bitmap
+diff --git a/mm/cma.c b/mm/cma.c
+index e1218e2..3d1e04e 100644
+--- a/mm/cma.c
++++ b/mm/cma.c
+@@ -69,13 +69,14 @@ static unsigned long cma_bitmap_pages_to_bits(struct cma *cma,
+ 
+ static void cma_clear_bitmap(struct cma *cma, unsigned long pfn, int count)
+ {
+-	unsigned long bitmap_no, bitmap_count;
++	unsigned long bitmap_no, bitmap_count, bitmap_maxno;
+ 
+ 	bitmap_no = (pfn - cma->base_pfn) >> cma->order_per_bit;
+ 	bitmap_count = cma_bitmap_pages_to_bits(cma, count);
++	bitmap_maxno = cma_bitmap_maxno(cma);
+ 
+ 	mutex_lock(&cma->lock);
+-	bitmap_clear(cma->bitmap, bitmap_no, bitmap_count);
++	bitmap_clear_guarded(cma->bitmap, bitmap_no, bitmap_count, cma->guards, bitmap_maxno);
+ 	mutex_unlock(&cma->lock);
+ }
+ 
+@@ -91,6 +92,13 @@ static int __init cma_activate_area(struct cma *cma)
+ 	if (!cma->bitmap)
+ 		return -ENOMEM;
+ 
++    cma->guards = kzalloc(bitmap_size, GFP_KERNEL);
++
++    if (!cma->guards) {
++	    kfree(cma->bitmap);
++        return -ENOMEM;
++    }
++
+ 	WARN_ON_ONCE(!pfn_valid(pfn));
+ 	zone = page_zone(pfn_to_page(pfn));
+ 
+@@ -122,7 +130,7 @@ static int __init cma_activate_area(struct cma *cma)
+ 	if (!PageHighMem(pfn_to_page(cma->base_pfn)))
+ 		kmemleak_free_part(__va(cma->base_pfn << PAGE_SHIFT),
+ 				cma->count << PAGE_SHIFT);
+-
++
+ 	return 0;
+ 
+ err:
+@@ -369,8 +377,8 @@ struct page *cma_alloc(struct cma *cma, size_t count, unsigned int align)
+ 
+ 	for (;;) {
+ 		mutex_lock(&cma->lock);
+-		bitmap_no = bitmap_find_next_zero_area(cma->bitmap,
+-				bitmap_maxno, start, bitmap_count, mask);
++		bitmap_no = bitmap_find_next_zero_area_guarded(cma->bitmap,
++				bitmap_maxno, start, bitmap_count, mask, cma->guards);
+ 		if (bitmap_no >= bitmap_maxno) {
+ 			if (retry_after_sleep < 2) {
+ 				start = 0;
+@@ -391,7 +399,7 @@ struct page *cma_alloc(struct cma *cma, size_t count, unsigned int align)
+ 				break;
+ 			}
+ 		}
+-		bitmap_set(cma->bitmap, bitmap_no, bitmap_count);
++		bitmap_set_guarded(cma->bitmap, bitmap_no, bitmap_count, cma->guards, bitmap_maxno);
+ 		/*
+ 		 * It's safe to drop the lock here. We've marked this region for
+ 		 * our exclusive use. If the migration fails we will take the
+diff --git a/mm/cma.h b/mm/cma.h
+index 1132d73..dae571b 100644
+--- a/mm/cma.h
++++ b/mm/cma.h
+@@ -5,6 +5,7 @@ struct cma {
+ 	unsigned long   base_pfn;
+ 	unsigned long   count;
+ 	unsigned long   *bitmap;
++    unsigned long   *guards; /* @vvdveen - dmasguard */
+ 	unsigned int order_per_bit; /* Order of pages represented by one bit */
+ 	struct mutex    lock;
+ #ifdef CONFIG_CMA_DEBUGFS
