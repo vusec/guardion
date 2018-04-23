@@ -9,7 +9,7 @@ This repository does *not* contain any exploit code for our RAMpage exploit.
 **If, for some weird reason, you think running this code broke your device, you get to keep both pieces.**
 
 # Patches
-All code was compiled and tested on a Google Pixel, running Android 7.1.1 (Nougat), with kernel version 3.18: `android-7.1.1_r0.5 / android-msm-marlin-3.18-nougat-mr1 Pixel XL (marlin) / Pixel (sailfish)`. The makefiles assume that you have a ARM64 sysroot install of the Android NDK (version r11c) in `/opt/android-ndk-r11c/sysroot-arm64/`. For more information on how to obtain such sysroot, have a look at the [Drammer README](https://github.com/vusec/drammer/blob/master/README.md).
+All code was compiled and tested on a Google Pixel, running Android 7.1.1 (Nougat), with kernel version 3.18: `android-7.1.1_r0.5 / android-msm-marlin-3.18-nougat-mr1 Pixel XL (marlin) / Pixel (sailfish)`. The makefiles assume that you have an ARM64 sysroot install of the Android NDK (version r11c) in `/opt/android-ndk-r11c/sysroot-arm64/`. For more information on how to obtain such sysroot, have a look at the [Drammer README](https://github.com/vusec/drammer/blob/master/README.md).
 
 A typical example of how to install our patches:
 
@@ -18,15 +18,13 @@ A typical example of how to install our patches:
     cd msm
     git checkout -b android-msm-marlin-3.18-nougat-mr1 origin/android-msm-marlin-3.18-nougat-mr1
 
-    # We compiled the kernel using android-ndk-r11c
     export CROSS_COMPILE=/opt/android-ndk-r11c/sysroot-arm64/bin/aarch64-linux-android-
     export ARCH=arm64
 
     make marlin_defconfig
     make -j6
-    # Run make menuconfig to enable loadable kernel module support if you want
-    # to compile nohammer (see below).
-    # Make sure to also enable "Module unloading".
+    # Run make menuconfig to enable loadable kernel module support if you want to compile nohammer (see below).
+    # (make sure to also enable "Module unloading")
 
     # This should result in a compiled kernel, we can now apply our patches and recompile:
     cd ~/msm
